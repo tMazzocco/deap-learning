@@ -27,7 +27,13 @@ export default function AnalyseScreen() {
 
   return (
     <View style={styles.container}>
-      <CaptureCamera intervalSec={settings.intervalSec} onCapture={onCapture} accent="#7c3aed">
+      <CaptureCamera
+        intervalSec={settings.intervalSec}
+        onCapture={onCapture}
+        maxSize={256}
+        quality={0.5}
+        accent="#7c3aed"
+      >
         <View style={styles.resultBox}>
           <Text style={styles.resultLabel}>Prediction</Text>
           <Text style={styles.result}>{result ? result.label : '—'}</Text>

@@ -25,6 +25,9 @@ from PIL import Image
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join("model", "model.h5"))
 LABELS_PATH = os.environ.get("LABELS_PATH", os.path.join("model", "labels.txt"))
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
+# Railguard: cap the longest edge of stored training samples (px). The phone
+# already shrinks, this protects the dataset if a client sends something big.
+MAX_SAMPLE_SIZE = int(os.environ.get("MAX_SAMPLE_SIZE", "1024"))
 # Model input size (H, W). Change to match your model.
 IMG_SIZE = (
     int(os.environ.get("IMG_HEIGHT", "224")),
@@ -94,10 +97,19 @@ def sample():
 
     fname = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".jpg"
     path = os.path.join(dest_dir, fname)
-    request.files["image"].save(path)
 
-    print(f"[sample] saved {path}")
-    return jsonify(saved=path, label=label)
+    # Railguard: downscale if the longest edge exceeds MAX_SAMPLE_SIZE.
+    img = Image.open(request.files["image"].stream).convert("RGB")
+    long_edge = max(img.size)
+    resized = False
+    if long_edge > MAX_SAMPLE_SIZE:
+        scale = MAX_SAMPLE_SIZE / long_edge
+        img = img.resize((round(img.width * scale), round(img.height * scale)))
+        resized = True
+    img.save(path, format="JPEG", quality=90)
+
+    print(f"[sample] saved {path} {img.size}{' (resized)' if resized else ''}")
+    return jsonify(saved=path, label=label, size=list(img.size), resized=resized)
 
 
 @app.post("/analyse")

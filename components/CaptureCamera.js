@@ -1,19 +1,50 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+
+// Downscale (cap long edge to maxSize) + re-compress to keep uploads small.
+// Only resizes when the photo is bigger than maxSize; always recompresses.
+async function shrink(photo, maxSize, quality) {
+  const longEdge = Math.max(photo.width || 0, photo.height || 0);
+  const actions = [];
+  if (longEdge > maxSize && longEdge > 0) {
+    const scale = maxSize / longEdge;
+    actions.push({
+      resize:
+        (photo.width || 0) >= (photo.height || 0)
+          ? { width: Math.round(photo.width * scale) }
+          : { height: Math.round(photo.height * scale) },
+    });
+  }
+  const result = await manipulateAsync(photo.uri, actions, {
+    compress: quality,
+    format: SaveFormat.JPEG,
+  });
+  return result.uri;
+}
 
 // Reusable auto-capture camera.
 //
 // Renders a live preview and drives a capture loop: every `intervalSec`
-// seconds it takes a picture and calls `onCapture(uri)`. Captures never
-// overlap — the next one waits until the previous `onCapture` resolves.
+// seconds it takes a picture, shrinks it on-device, then calls `onCapture(uri)`.
+// Captures never overlap — the next one waits until the previous resolves.
 //
 // Props:
 //   intervalSec : number  seconds between captures
 //   onCapture   : (uri) => Promise<void>
+//   maxSize     : number  cap for the longest image edge (px), default 1024
+//   quality     : number  JPEG compression 0..1, default 0.8
 //   accent      : string  color for the start button
 //   children    : extra UI rendered under the controls (label input, result...)
-export default function CaptureCamera({ intervalSec, onCapture, accent = '#2563eb', children }) {
+export default function CaptureCamera({
+  intervalSec,
+  onCapture,
+  maxSize = 1024,
+  quality = 0.8,
+  accent = '#2563eb',
+  children,
+}) {
   const [permission, requestPermission] = useCameraPermissions();
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -32,11 +63,12 @@ export default function CaptureCamera({ intervalSec, onCapture, accent = '#2563e
     setError(null);
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.6,
+        quality: 0.9,
         skipProcessing: true,
       });
       if (photo?.uri) {
-        await onCaptureRef.current(photo.uri);
+        const uri = await shrink(photo, maxSize, quality);
+        await onCaptureRef.current(uri);
         setCount((c) => c + 1);
       }
     } catch (e) {
@@ -44,7 +76,7 @@ export default function CaptureCamera({ intervalSec, onCapture, accent = '#2563e
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [maxSize, quality]);
 
   // Recursive timeout loop (avoids overlap even when uploads are slow).
   const scheduleNext = useCallback(() => {

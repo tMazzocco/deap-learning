@@ -28,7 +28,13 @@ export default function SampleScreen() {
 
   return (
     <View style={styles.container}>
-      <CaptureCamera intervalSec={settings.intervalSec} onCapture={onCapture} accent="#2563eb">
+      <CaptureCamera
+        intervalSec={settings.intervalSec}
+        onCapture={onCapture}
+        maxSize={1024}
+        quality={0.85}
+        accent="#2563eb"
+      >
         <View style={styles.field}>
           <Text style={styles.label}>Label (optional, sent with each photo)</Text>
           <TextInput
