@@ -84,9 +84,23 @@ class ImageList(Dataset):
         return self.transform(img), self.labels[i]
 
 
+def freeze_untrained_bn(model):
+    """Put BatchNorm layers that are frozen into eval mode so their running
+    stats don't drift on small datasets (standard fine-tuning practice)."""
+    import torch.nn as nn
+
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            params = list(m.parameters())
+            if params and not any(p.requires_grad for p in params):
+                m.eval()
+
+
 def run_epoch(model, loader, device, criterion, optimizer=None):
     train = optimizer is not None
     model.train(train)
+    if train:
+        freeze_untrained_bn(model)
     total, correct, loss_sum = 0, 0, 0.0
     torch.set_grad_enabled(train)
     for x, y in loader:
@@ -103,13 +117,74 @@ def run_epoch(model, loader, device, criterion, optimizer=None):
     return loss_sum / total, correct / total
 
 
+def freeze_all_but_head(model):
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.get_classifier().parameters():
+        p.requires_grad = True
+
+
+def unfreeze_top(model, n_blocks):
+    """Unfreeze the head + final conv/bn + the last n_blocks backbone stages."""
+    freeze_all_but_head(model)
+    for name in ("conv_head", "bn2"):  # timm EfficientNet head-side layers
+        mod = getattr(model, name, None)
+        if mod is not None:
+            for p in mod.parameters():
+                p.requires_grad = True
+    blocks = getattr(model, "blocks", None)
+    if blocks is not None and n_blocks > 0:
+        for stage in list(blocks)[-n_blocks:]:
+            for p in stage.parameters():
+                p.requires_grad = True
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"[finetune] trainable params {n_train:,} / {n_total:,}")
+
+
+def fit(model, train_loader, val_loader, device, lr, epochs, patience, tag, best):
+    """Train `epochs`, track best val acc into `best` dict, early-stop on
+    `patience` epochs without val improvement. Returns nothing; mutates `best`."""
+    import copy
+
+    criterion = torch.nn.CrossEntropyLoss()
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    stale = 0
+    for e in range(epochs):
+        tl, ta = run_epoch(model, train_loader, device, criterion, optimizer)
+        line = f"[{tag}] epoch {e + 1}/{epochs}  train_loss {tl:.4f} acc {ta:.3f}"
+        if val_loader is not None:
+            vl, va = run_epoch(model, val_loader, device, criterion)
+            line += f"  val_loss {vl:.4f} acc {va:.3f}"
+            if va > best["val_acc"]:
+                best["val_acc"] = va
+                best["state"] = copy.deepcopy(model.state_dict())
+                stale = 0
+                line += "  *best"
+            else:
+                stale += 1
+        else:
+            best["state"] = copy.deepcopy(model.state_dict())  # no val: keep last
+        print(line)
+        if patience and val_loader is not None and stale >= patience:
+            print(f"[{tag}] early stop (no val gain in {patience} epochs)")
+            break
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--samples", default="samples")
-    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--epochs", type=int, default=1, help="fine-tune epochs (or head epochs if --finetune off)")
+    ap.add_argument("--warmup-epochs", type=int, default=3, help="head-only epochs before unfreezing")
+    ap.add_argument("--finetune", action="store_true", help="unfreeze top blocks after warmup")
+    ap.add_argument("--unfreeze", type=int, default=2, help="how many top backbone stages to unfreeze")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--val-split", type=float, default=0.2)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-3, help="head/warmup LR")
+    ap.add_argument("--ft-lr", type=float, default=1e-4, help="fine-tune LR (lower!)")
+    ap.add_argument("--patience", type=int, default=6, help="early-stop patience (0=off)")
     ap.add_argument("--out", default=os.path.join("model", "model.pt"))
     ap.add_argument("--labels-out", default=os.path.join("model", "labels.txt"))
     args = ap.parse_args()
@@ -122,11 +197,7 @@ def main():
 
     # Frozen backbone + fresh N+1 head.
     model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=len(class_names))
-    for p in model.parameters():
-        p.requires_grad = False
-    head = model.get_classifier()
-    for p in head.parameters():
-        p.requires_grad = True
+    freeze_all_but_head(model)
     model.to(device)
 
     # timm-correct normalization/size; strong augmentation on train for the
@@ -153,16 +224,23 @@ def main():
         train_set = ImageList(files, labels, train_tf)
     train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    best = {"val_acc": -1.0, "state": None}
 
-    for e in range(args.epochs):
-        tl, ta = run_epoch(model, train_loader, device, criterion, optimizer)
-        msg = f"epoch {e + 1}/{args.epochs}  train_loss {tl:.4f} acc {ta:.3f}"
-        if val_loader is not None:
-            vl, va = run_epoch(model, val_loader, device, criterion)
-            msg += f"  val_loss {vl:.4f} acc {va:.3f}"
-        print(msg)
+    # Phase 1: warm up the fresh head on the frozen backbone.
+    warmup = args.warmup_epochs if args.finetune else args.epochs
+    if warmup > 0:
+        fit(model, train_loader, val_loader, device, args.lr, warmup, args.patience, "warmup", best)
+
+    # Phase 2: unfreeze top blocks and fine-tune at a lower LR.
+    if args.finetune:
+        unfreeze_top(model, args.unfreeze)
+        fit(model, train_loader, val_loader, device, args.ft_lr, args.epochs, args.patience, "finetune", best)
+
+    # Restore the best-val weights before saving.
+    if best["state"] is not None:
+        model.load_state_dict(best["state"])
+    if val_loader is not None:
+        print(f"[best] val acc {best['val_acc']:.3f}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save(

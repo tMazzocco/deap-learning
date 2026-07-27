@@ -47,6 +47,26 @@ Both scan `samples/<label>/`, build `(objects + 1)` output neurons with the
 trailing one reserved for **"other"** (fed by `other/` or `unlabeled/`
 folders), and default to 1 epoch. Use `--epochs N` for real runs.
 
+### Fine-tuning (PyTorch, best accuracy)
+
+Frozen-backbone training plateaus. To unfreeze and fine-tune the top backbone
+stages after a short head warmup:
+
+```bash
+python train_torch.py --finetune --warmup-epochs 3 --epochs 40 \
+                      --unfreeze 2 --lr 1e-3 --ft-lr 1e-4
+```
+
+- `--warmup-epochs` head-only epochs before unfreezing (`--lr`).
+- `--finetune` then unfreezes the last `--unfreeze` backbone stages + head and
+  trains `--epochs` more at the lower `--ft-lr`.
+- Early stopping on `--patience` epochs without val gain (0 = off); the
+  **best-val** weights are what gets saved. Frozen BatchNorm layers stay in eval
+  mode to keep their stats stable on small data.
+
+Underfitting (low train+val acc)? unfreeze more (`--unfreeze 3`) and/or add data.
+Overfitting (train ≫ val)? fewer unfrozen stages, more data/augmentation.
+
 ## Plug your AI
 
 Training writes the model + `labels.txt` for you. To plug a pre-made model
