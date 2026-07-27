@@ -1,0 +1,8 @@
+# PyTorch training deps (native GPU on Windows).
+# Install torch/torchvision from the CUDA index FIRST:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# then:
+#   pip install -r requirements-torch.txt
+timm==1.0.11
+pillow==11.0.0
+flask==3.1.0
