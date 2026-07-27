@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+
+# captured dataset
+samples/
+
+# your plugged-in model (add manually)
+model/*.h5
