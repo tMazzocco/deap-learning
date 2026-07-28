@@ -79,7 +79,9 @@ def _load_tf(path):
 
     def predict(img):
         img = img.resize((IMG_SIZE[1], IMG_SIZE[0]))  # PIL is (W, H)
-        arr = np.asarray(img, dtype="float32") / 255.0
+        # Raw [0, 255]: EfficientNetV2 normalizes inside the backbone, and
+        # train.py feeds it the same way. Do NOT divide by 255 here.
+        arr = np.asarray(img, dtype="float32")
         preds = model.predict(np.expand_dims(arr, 0), verbose=0)[0]
         idx = int(np.argmax(preds))
         label = labels[idx] if idx < len(labels) else str(idx)

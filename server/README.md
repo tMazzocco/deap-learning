@@ -43,11 +43,33 @@ python train.py            # TensorFlow -> model/model.h5  + labels.txt
 python train_torch.py      # PyTorch    -> model/model.pt  + labels.txt
 ```
 
-Both scan `samples/<label>/`, build `(objects + 1)` output neurons with the
+Both scan `samples/<label>/` and build `(objects + 1)` output neurons with the
 trailing one reserved for **"other"** (fed by `other/` or `unlabeled/`
-folders), and default to 1 epoch. Use `--epochs N` for real runs.
+folders).
 
-### Fine-tuning (PyTorch, best accuracy)
+The TensorFlow side is split in two files, no CLI flags — edit the constants:
+
+| file       | what it owns                                              |
+|------------|-----------------------------------------------------------|
+| `data.py`  | photo ingestion: folder scan, `IMG_SIZE`, `BATCH`, `VAL_SPLIT`, train/val split, `AUGMENT` |
+| `train.py` | `BACKBONE`, epochs, learning rates, fine-tuning, saving   |
+
+`train.py` runs two phases: **warmup** (`EPOCHS` at `LR`, backbone frozen, only
+the new head learns), then **finetune** (`FINETUNE_EPOCHS` at the lower `FT_LR`
+with the top `UNFREEZE_LAYERS` of the backbone unfrozen). Set `FINETUNE = False`
+to stop after the warmup. Each phase early-stops after `PATIENCE` epochs with no
+val gain and keeps its best weights.
+
+Underfitting (low train+val acc)? raise `UNFREEZE_LAYERS` and/or add data.
+Overfitting (train ≫ val)? lower it, add data or stronger `AUGMENT`.
+
+Swapping `BACKBONE` for another `tf.keras.applications` model: EfficientNet
+takes raw `[0, 255]` pixels, so families expecting `[-1, 1]` need a `Rescaling`
+layer in `build_model()`, and `data.IMG_SIZE` must match the backbone.
+MobileNetV3 and ConvNeXt can't be reloaded from legacy `.h5` under Keras 3 —
+point `OUT_MODEL` at `model/model.keras` if you pick one.
+
+### Fine-tuning (PyTorch, CLI flags)
 
 Frozen-backbone training plateaus. To unfreeze and fine-tune the top backbone
 stages after a short head warmup:

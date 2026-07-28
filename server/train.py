@@ -1,145 +1,172 @@
-"""Transfer-learn EfficientNetV2-B0 on the captured samples.
+"""Transfer-learn + fine-tune a backbone on the captured samples.
 
-Reads samples/<label>/*.jpg (the folders written by /sample), and fine-tunes a
-head on top of a frozen ImageNet EfficientNetV2-B0 backbone.
+Photo ingestion lives in data.py; this file is the model and the schedule.
+Two phases:
 
-Classes = every object folder found, PLUS a trailing "other" neuron:
+    1. warmup    backbone frozen, only the fresh head learns (LR)
+    2. finetune  top UNFREEZE_LAYERS of the backbone unfrozen, lower FT_LR
+
+Classes come from data.py: every object folder found, PLUS a trailing "other"
+neuron fed by `other/` or `unlabeled/` folders.
 
     output neurons = (number of object labels) + 1        # last one = "other"
-
-Any image sitting in an `other/` or `unlabeled/` folder feeds that last neuron.
 
 Outputs (consumed directly by app.py):
     model/model.h5     the trained Keras model
     model/labels.txt   class names, one per line, in output order
 
-Quick local smoke test (default 1 epoch):
+Run it:
     python train.py
 
-Real training happens elsewhere — bump epochs / unfreeze there:
-    python train.py --epochs 30
+No CLI flags: edit the constants below (and data.py for anything photo-side).
 """
 
-import argparse
 import os
 
+import numpy as np
 import tensorflow as tf
 
-# EfficientNetV2 models expect raw pixels in [0, 255] (normalization is baked
-# into the backbone), so we do NOT rescale here.
-IMAGENET_INPUT = 224
+import data
 
-# Folder names that are not real objects -> folded into the "other" class.
-OTHER_ALIASES = {"other", "unlabeled"}
+# --- knobs ------------------------------------------------------------------
+SAMPLES_DIR = "samples"
+OUT_MODEL = os.path.join("model", "model.h5")
+OUT_LABELS = os.path.join("model", "labels.txt")
 
+# The backbone. Its ImageNet weights are downloaded on first run. EfficientNet
+# takes raw [0, 255] pixels (it normalizes internally) — swapping in a family
+# that expects [-1, 1] means adding a Rescaling layer in build_model().
+# Note: MobileNetV3 / ConvNeXt cannot be reloaded from legacy .h5 under Keras 3
+# — if you pick one, change OUT_MODEL to model/model.keras.
+BACKBONE = tf.keras.applications.EfficientNetV2B0
 
-def collect(samples_dir):
-    """Return (files, labels, class_names).
+DROPOUT = 0.4
+EPOCHS = 50
+LR = 1e-3
 
-    class_names ends with "other"; label ints index into class_names.
-    """
-    if not os.path.isdir(samples_dir):
-        raise SystemExit(f"no samples dir: {samples_dir}")
+FINETUNE = True  # phase 2 on/off
+FINETUNE_EPOCHS = 15
+FT_LR = 1e-4  # must stay well below LR or the pretrained weights get wrecked
+# How many of the backbone's top layers to unfreeze. Keep it low: a few hundred
+# near-duplicate photos cannot support a million trainable params — the phase
+# just memorizes them and early stopping throws the whole thing away.
+UNFREEZE_LAYERS = 15
+PATIENCE = 5  # stop a phase after N epochs without val gain (0 = off)
 
-    subdirs = sorted(
-        d for d in os.listdir(samples_dir) if os.path.isdir(os.path.join(samples_dir, d))
-    )
-    object_labels = [d for d in subdirs if d.lower() not in OTHER_ALIASES]
-    class_names = object_labels + ["other"]  # <-- the +1 neuron, always last
-    other_idx = len(class_names) - 1
-    index_of = {name: i for i, name in enumerate(object_labels)}
-
-    files, labels = [], []
-    for d in subdirs:
-        idx = index_of.get(d, other_idx)  # unknown/alias folders -> other
-        folder = os.path.join(samples_dir, d)
-        for fn in os.listdir(folder):
-            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
-                files.append(os.path.join(folder, fn))
-                labels.append(idx)
-
-    if not files:
-        raise SystemExit(f"no images found under {samples_dir}")
-    return files, labels, class_names
+print(f"[train] using TensorFlow {tf.__version__} with GPU: {tf.config.list_physical_devices('GPU')}")
 
 
-def make_ds(files, labels, img_size, batch, training):
-    def load(path, label):
-        img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
-        img = tf.image.resize(img, (img_size, img_size))
-        img = tf.cast(img, tf.float32)  # keep [0, 255] for EfficientNetV2
-        return img, label
-
-    ds = tf.data.Dataset.from_tensor_slices((files, labels))
-    if training:
-        ds = ds.shuffle(min(len(files), 1000), reshuffle_each_iteration=True)
-    ds = ds.map(load, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.batch(batch).prefetch(tf.data.AUTOTUNE)
-
-
-def build_model(num_classes, img_size):
-    base = tf.keras.applications.EfficientNetV2B0(
+def build_model(num_classes):
+    """Frozen backbone + fresh (N+1)-way head. Returns (model, backbone)."""
+    base = BACKBONE(
         include_top=False,
         weights="imagenet",
-        input_shape=(img_size, img_size, 3),
+        input_shape=(data.IMG_SIZE, data.IMG_SIZE, 3),
         pooling="avg",
     )
-    base.trainable = False  # feature-extraction for the quick test
+    base.trainable = False  # phase 1: feature extraction
 
-    inputs = tf.keras.Input(shape=(img_size, img_size, 3))
-    # Light augmentation, only active during training.
-    x = tf.keras.layers.RandomFlip("horizontal")(inputs)
-    x = base(x, training=False)
-    x = tf.keras.layers.Dropout(0.2)(x)
+    inputs = tf.keras.Input(shape=(data.IMG_SIZE, data.IMG_SIZE, 3))
+    # training=False pins BatchNorm to inference mode for good — that is what
+    # keeps its running stats stable once we unfreeze for fine-tuning.
+    x = base(inputs, training=False)
+    x = tf.keras.layers.Dropout(DROPOUT)(x)
     outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, outputs), base
 
-    model = tf.keras.Model(inputs, outputs)
+
+def unfreeze_top(base):
+    """Unfreeze the top UNFREEZE_LAYERS of the backbone, BatchNorm excepted
+    (its running stats would drift on a few hundred photos)."""
+    base.trainable = True
+    for layer in base.layers[:-UNFREEZE_LAYERS]:
+        layer.trainable = False
+    for layer in base.layers[-UNFREEZE_LAYERS:]:
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = False
+
+
+def fit(tag, model, training_ds, test_ds, epochs, lr, class_weight=None):
+    """Compile at the given LR and train. Recompiling is mandatory after any
+    trainable-flag change, so each phase gets a fresh optimizer."""
     model.compile(
-        optimizer="adam",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
-    return model
+    callbacks = []
+    if test_ds is not None and PATIENCE:
+        callbacks.append(
+            # Keras calls the held-out metrics val_loss / val_accuracy — that
+            # is our X_test / y_test. Watch the loss, not the accuracy: on a
+            # small test set accuracy moves in coarse steps and ties resolve to
+            # the earliest epoch, throwing away the epochs that actually
+            # improved the model. Loss is continuous and sees that.
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=PATIENCE,
+                restore_best_weights=True,
+                verbose=1,
+            )
+        )
+    trainable = sum(int(tf.size(w)) for w in model.trainable_weights)
+    print(f"[{tag}] {epochs} epochs, lr {lr:g}, trainable params {trainable:,}")
+    model.fit(
+        training_ds,
+        validation_data=test_ds,
+        epochs=epochs,
+        class_weight=class_weight,
+        callbacks=callbacks,
+        shuffle=False,
+    )
+
+
+def report(model, test_ds, class_names):
+    """Confusion matrix + per-class accuracy, so a bad class is visible
+    instead of hidden inside one average number."""
+    y_test = np.concatenate([y.numpy() for _, y in test_ds])
+    y_pred = np.argmax(model.predict(test_ds, verbose=0), axis=1)
+
+    n = len(class_names)
+    matrix = np.zeros((n, n), dtype=int)
+    for true, pred in zip(y_test, y_pred):
+        matrix[true, pred] += 1
+
+    width = max(len(c) for c in class_names) + 2
+    print("\n[eval] confusion matrix (rows = true, columns = predicted)")
+    print(" " * width + "".join(f"{c:>14}" for c in class_names))
+    for i, name in enumerate(class_names):
+        print(f"{name:<{width}}" + "".join(f"{v:>14}" for v in matrix[i]))
+
+    print("[eval] per-class accuracy")
+    for i, name in enumerate(class_names):
+        total = matrix[i].sum()
+        acc = f"{matrix[i, i] / total:.3f}" if total else "  n/a"
+        print(f"[eval]   {name:<{width}} {acc}  ({matrix[i, i]}/{total})")
+    print(f"[eval] overall test accuracy {np.trace(matrix) / matrix.sum():.3f}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--samples", default="samples")
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--img-size", type=int, default=IMAGENET_INPUT)
-    ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--val-split", type=float, default=0.2)
-    ap.add_argument("--out", default=os.path.join("model", "model.h5"))
-    ap.add_argument("--labels-out", default=os.path.join("model", "labels.txt"))
-    args = ap.parse_args()
+    training_ds, test_ds, class_names, class_weight = data.load(SAMPLES_DIR)
+    model, base = build_model(len(class_names))
 
-    files, labels, class_names = collect(args.samples)
-    print(f"[data] {len(files)} images, {len(class_names)} classes: {class_names}")
+    if EPOCHS > 0:
+        fit("warmup", model, training_ds, test_ds, EPOCHS, LR, class_weight)
 
-    # Simple deterministic split.
-    idx = tf.range(len(files))
-    idx = tf.random.shuffle(idx, seed=42).numpy()
-    files = [files[i] for i in idx]
-    labels = [labels[i] for i in idx]
+    if FINETUNE and FINETUNE_EPOCHS > 0:
+        unfreeze_top(base)
+        fit("finetune", model, training_ds, test_ds, FINETUNE_EPOCHS, FT_LR, class_weight)
 
-    n_val = int(len(files) * args.val_split)
-    val_ds = None
-    if n_val >= len(class_names) and len(files) - n_val > 0:
-        train_ds = make_ds(files[n_val:], labels[n_val:], args.img_size, args.batch, True)
-        val_ds = make_ds(files[:n_val], labels[:n_val], args.img_size, args.batch, False)
-    else:
-        print("[data] too few images for a validation split, training on all")
-        train_ds = make_ds(files, labels, args.img_size, args.batch, True)
+    if test_ds is not None:
+        report(model, test_ds, class_names)
 
-    model = build_model(len(class_names), args.img_size)
-    model.fit(train_ds, validation_data=val_ds, epochs=args.epochs)
-
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    model.save(args.out)
-    with open(args.labels_out, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(OUT_MODEL) or ".", exist_ok=True)
+    model.save(OUT_MODEL)
+    with open(OUT_LABELS, "w", encoding="utf-8") as f:
         f.write("\n".join(class_names) + "\n")
 
-    print(f"[done] saved {args.out} and {args.labels_out}")
+    print(f"[done] saved {OUT_MODEL} and {OUT_LABELS}")
 
 
 if __name__ == "__main__":
