@@ -6,14 +6,16 @@ Two routes, matching the Expo app:
                  -> saves the photo under samples/<label>/ for dataset building.
 
   POST /analyse  multipart: image (jpeg)
-                 -> runs the model and returns {label, confidence}.
+                 -> runs the model and returns {label, confidence}. A top class
+                    below CONF_THRESHOLD is reported as OTHER_LABEL.
 
-Plug your model manually. Two backends, auto-detected by file extension:
+Plug your model manually. TensorFlow/Keras only:
 
-  * model/model.h5  -> TensorFlow/Keras (train.py). Needs model/labels.txt.
-  * model/model.pt  -> PyTorch/timm      (train_torch.py). Labels are baked in.
+  * model/model.keras -> native Keras 3 format, written by train.py.
+  * model/model.h5    -> same, legacy format.
 
-Set MODEL_PATH to force one, otherwise .pt is preferred if present, else .h5.
+Both need model/labels.txt, one class per line in output order. Set MODEL_PATH
+to force a file, otherwise .keras wins over .h5.
 No model? /sample still works; /analyse returns 503.
 """
 
@@ -30,24 +32,38 @@ SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
 # Railguard: cap the longest edge of stored training samples (px). The phone
 # already shrinks, this protects the dataset if a client sends something big.
 MAX_SAMPLE_SIZE = int(os.environ.get("MAX_SAMPLE_SIZE", "1024"))
-# TF backend only: model input size (H, W). Torch reads its own from the ckpt.
+# Model input size (H, W). Must match what the model was trained at.
 IMG_SIZE = (
     int(os.environ.get("IMG_HEIGHT", "224")),
     int(os.environ.get("IMG_WIDTH", "224")),
 )
+# Below this top-class probability the answer is not trusted and gets reported
+# as OTHER_LABEL instead. Softmax always sums to 1, so a model shown something
+# it never trained on still returns a winner — this is what stops that winner
+# from being announced as a real object. 0 disables the check.
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.6"))
+OTHER_LABEL = os.environ.get("OTHER_LABEL", "other")
 
 app = Flask(__name__)
 
 
+# Auto-detection order, highest priority first. .keras is the native Keras 3
+# format train.py writes; .h5 is the legacy fallback.
+MODEL_CANDIDATES = (
+    os.path.join("model", "model.keras"),
+    os.path.join("model", "model.h5"),
+)
+
+
 def resolve_model_path():
-    """Explicit MODEL_PATH wins; else prefer a .pt, then a .h5."""
+    """Explicit MODEL_PATH wins; else first existing MODEL_CANDIDATES entry."""
     env = os.environ.get("MODEL_PATH")
     if env:
         return env
-    for candidate in (os.path.join("model", "model.pt"), os.path.join("model", "model.h5")):
+    for candidate in MODEL_CANDIDATES:
         if os.path.exists(candidate):
             return candidate
-    return os.path.join("model", "model.h5")
+    return MODEL_CANDIDATES[0]
 
 
 MODEL_PATH = resolve_model_path()
@@ -59,7 +75,7 @@ _file_labels = None
 
 
 def get_file_labels():
-    """labels.txt (used by the TF backend)."""
+    """labels.txt, one class per line in the model's output order."""
     global _file_labels
     if _file_labels is None:
         if os.path.exists(LABELS_PATH):
@@ -70,12 +86,17 @@ def get_file_labels():
     return _file_labels
 
 
-def _load_tf(path):
+def _load_model(path):
     import numpy as np
     import tensorflow as tf
 
     model = tf.keras.models.load_model(path)
     labels = get_file_labels()
+    if CONF_THRESHOLD > 0 and OTHER_LABEL not in labels:
+        print(
+            f"[warn] '{OTHER_LABEL}' is not in {LABELS_PATH}; low-confidence "
+            f"answers will still be reported as '{OTHER_LABEL}'"
+        )
 
     def predict(img):
         img = img.resize((IMG_SIZE[1], IMG_SIZE[0]))  # PIL is (W, H)
@@ -84,31 +105,13 @@ def _load_tf(path):
         arr = np.asarray(img, dtype="float32")
         preds = model.predict(np.expand_dims(arr, 0), verbose=0)[0]
         idx = int(np.argmax(preds))
+        conf = float(preds[idx])
+        if conf < CONF_THRESHOLD:
+            # Keep conf as the top probability that failed, not the "other"
+            # class's own: the client shows how close the call was.
+            return OTHER_LABEL, conf
         label = labels[idx] if idx < len(labels) else str(idx)
-        return label, float(preds[idx])
-
-    return predict
-
-
-def _load_torch(path):
-    import timm
-    import torch
-    from timm.data import create_transform, resolve_model_data_config
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = torch.load(path, map_location=device)
-    labels = ckpt["classes"]  # authoritative, in output order
-    model = timm.create_model(ckpt["model_name"], num_classes=len(labels))
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval().to(device)
-    transform = create_transform(**{**resolve_model_data_config(model), "is_training": False})
-
-    def predict(img):
-        x = transform(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            probs = torch.softmax(model(x)[0], dim=0)
-        conf, idx = torch.max(probs, dim=0)
-        return labels[int(idx)], float(conf)
+        return label, conf
 
     return predict
 
@@ -119,10 +122,7 @@ def get_predictor():
     if _predict is None:
         if not os.path.exists(MODEL_PATH):
             return None
-        if MODEL_PATH.endswith(".pt"):
-            _predict = _load_torch(MODEL_PATH)
-        else:
-            _predict = _load_tf(MODEL_PATH)
+        _predict = _load_model(MODEL_PATH)
         print(f"[model] loaded {MODEL_PATH}")
     return _predict
 
@@ -130,12 +130,12 @@ def get_predictor():
 # --- Routes -----------------------------------------------------------------
 @app.get("/")
 def health():
-    backend = "torch" if MODEL_PATH.endswith(".pt") else "tensorflow"
     return jsonify(
         status="ok",
         model_path=MODEL_PATH,
         model_loaded=os.path.exists(MODEL_PATH),
-        backend=backend,
+        backend="tensorflow",
+        conf_threshold=CONF_THRESHOLD,
     )
 
 

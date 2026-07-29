@@ -30,14 +30,14 @@ import data
 
 # --- knobs ------------------------------------------------------------------
 SAMPLES_DIR = "samples"
-OUT_MODEL = os.path.join("model", "model.h5")
+OUT_MODEL = os.path.join("model", "model.keras")
 OUT_LABELS = os.path.join("model", "labels.txt")
 
 # The backbone. Its ImageNet weights are downloaded on first run. EfficientNet
 # takes raw [0, 255] pixels (it normalizes internally) — swapping in a family
 # that expects [-1, 1] means adding a Rescaling layer in build_model().
-# Note: MobileNetV3 / ConvNeXt cannot be reloaded from legacy .h5 under Keras 3
-# — if you pick one, change OUT_MODEL to model/model.keras.
+# Note: OUT_MODEL is the native .keras format on purpose — MobileNetV3 and
+# ConvNeXt cannot be reloaded from legacy .h5 under Keras 3.
 BACKBONE = tf.keras.applications.EfficientNetV2B0
 
 DROPOUT = 0.4

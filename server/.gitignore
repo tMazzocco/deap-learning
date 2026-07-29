@@ -6,4 +6,5 @@ __pycache__/
 samples/
 
 # your plugged-in model (add manually)
+model/*.keras
 model/*.h5

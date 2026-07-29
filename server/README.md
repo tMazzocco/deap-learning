@@ -1,16 +1,22 @@
 # PoC classification server
 
 Small, dumb Flask server for the Expo photo-classification app. Loads a model
-manually and exposes the two routes the app calls. Two interchangeable
-backends, auto-detected by file extension:
+manually and exposes the two routes the app calls. **TensorFlow/Keras only.**
 
-- **TensorFlow** — `model/model.h5`, trained by `train.py`.
-- **PyTorch** — `model/model.pt`, trained by `train_torch.py` (GPU on native
-  Windows, e.g. RTX 4080).
+- `model/model.keras` — native Keras 3 format, written by `train.py`.
+- `model/model.h5` — legacy format, still loads.
 
-`.pt` is preferred if present, else `.h5`; force one with `MODEL_PATH`.
+Auto-detection: `model.keras` first, then `model.h5` — the first that exists
+wins. Force any file with `MODEL_PATH`.
 
 ## Routes
+
+A top class scoring below `CONF_THRESHOLD` (default **0.6**) is reported as
+`other` rather than guessed. Softmax always sums to 1, so a photo of something
+the model never trained on still produces a winner — the threshold is what keeps
+that winner from being announced as a real object. The returned `confidence`
+stays the top probability that failed the check, so the client can see how close
+it was. Set `CONF_THRESHOLD=0` to disable.
 
 | method | route      | body (multipart)          | returns                          |
 |--------|------------|---------------------------|----------------------------------|
@@ -29,25 +35,17 @@ source venv/Scripts/activate   # Windows Git Bash;  venv\Scripts\activate in cmd
 pip install -r requirements.txt          # TensorFlow (CPU on Windows)
 ```
 
-**PyTorch + GPU (native Windows):**
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements-torch.txt
-```
-
 ## Train
 
 ```bash
-python train.py            # TensorFlow -> model/model.h5  + labels.txt
-python train_torch.py      # PyTorch    -> model/model.pt  + labels.txt
+python train.py            # -> model/model.keras + labels.txt
 ```
 
-Both scan `samples/<label>/` and build `(objects + 1)` output neurons with the
+It scans `samples/<label>/` and builds `(objects + 1)` output neurons with the
 trailing one reserved for **"other"** (fed by `other/` or `unlabeled/`
 folders).
 
-The TensorFlow side is split in two files, no CLI flags — edit the constants:
+Training is split in two files, no CLI flags — edit the constants:
 
 | file       | what it owns                                              |
 |------------|-----------------------------------------------------------|
@@ -66,35 +64,33 @@ Overfitting (train ≫ val)? lower it, add data or stronger `AUGMENT`.
 Swapping `BACKBONE` for another `tf.keras.applications` model: EfficientNet
 takes raw `[0, 255]` pixels, so families expecting `[-1, 1]` need a `Rescaling`
 layer in `build_model()`, and `data.IMG_SIZE` must match the backbone.
-MobileNetV3 and ConvNeXt can't be reloaded from legacy `.h5` under Keras 3 —
-point `OUT_MODEL` at `model/model.keras` if you pick one.
-
-### Fine-tuning (PyTorch, CLI flags)
-
-Frozen-backbone training plateaus. To unfreeze and fine-tune the top backbone
-stages after a short head warmup:
-
-```bash
-python train_torch.py --finetune --warmup-epochs 3 --epochs 40 \
-                      --unfreeze 2 --lr 1e-3 --ft-lr 1e-4
-```
-
-- `--warmup-epochs` head-only epochs before unfreezing (`--lr`).
-- `--finetune` then unfreezes the last `--unfreeze` backbone stages + head and
-  trains `--epochs` more at the lower `--ft-lr`.
-- Early stopping on `--patience` epochs without val gain (0 = off); the
-  **best-val** weights are what gets saved. Frozen BatchNorm layers stay in eval
-  mode to keep their stats stable on small data.
-
-Underfitting (low train+val acc)? unfreeze more (`--unfreeze 3`) and/or add data.
-Overfitting (train ≫ val)? fewer unfrozen stages, more data/augmentation.
+`OUT_MODEL` is `model/model.keras` (native Keras 3 format) — MobileNetV3 and
+ConvNeXt can't be reloaded from legacy `.h5` under Keras 3, so leave it alone
+unless you have a reason.
 
 ## Plug your AI
 
 Training writes the model + `labels.txt` for you. To plug a pre-made model
-manually, drop `model/model.h5` (Keras) or `model/model.pt` (the dict saved by
-`train_torch.py`). For `.h5`, also provide `model/labels.txt` in output order;
-`.pt` carries its own labels. TF input not 224×224? set `IMG_HEIGHT`/`IMG_WIDTH`.
+manually, drop `model/model.keras` (or `model/model.h5`) plus
+`model/labels.txt`, one class per line **in output order** — a mismatch there
+shows up as confidently wrong labels, not as an error. Input not 224×224? set
+`IMG_HEIGHT`/`IMG_WIDTH`. The server feeds raw `[0, 255]` pixels, so a model
+without internal normalization needs its own `Rescaling` layer.
+
+### labels.txt for a model trained elsewhere
+
+If the model came from `image_dataset_from_directory(..., labels="inferred")`,
+Keras assigned class indices as `sorted(os.listdir(dataset_dir))` — plain
+alphabetical, **not** creation order and **not** "other last". Regenerate the
+file from the dataset folder instead of writing it by hand:
+
+```bash
+python make_labels.py --dataset path/to/datasets/objects100 \
+                      --model model/model.keras
+```
+
+`--model` compares the class count against the model's output units and refuses
+to write on a mismatch. `--dry-run` prints the order without touching anything.
 
 ## Run
 
@@ -112,8 +108,10 @@ model is present.
 
 | var          | default              | meaning                          |
 |--------------|----------------------|----------------------------------|
-| `MODEL_PATH` | `.pt` if present else `.h5` | force a specific model file |
-| `LABELS_PATH`| `model/labels.txt`   | class-name list (TF backend)     |
+| `MODEL_PATH` | `model.keras`, else `model.h5` | force a specific model file |
+| `LABELS_PATH`| `model/labels.txt`   | class-name list, in output order |
+| `CONF_THRESHOLD` | `0.6`            | below this top probability, answer `other` (0 = off) |
+| `OTHER_LABEL`| `other`              | label used when the threshold rejects |
 | `SAMPLES_DIR`| `samples`            | where `/sample` writes           |
-| `IMG_HEIGHT` / `IMG_WIDTH` | `224` / `224` | TF backend input size   |
+| `IMG_HEIGHT` / `IMG_WIDTH` | `224` / `224` | model input size        |
 | `PORT`       | `8000`               | listen port                      |
